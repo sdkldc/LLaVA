@@ -1,4 +1,6 @@
 import os
+import json
+import warnings
 import torch
 import torch.nn as nn
 
@@ -12,7 +14,8 @@ from transformers.trainer import (
     ALL_LAYERNORM_LAYERS,
     logger,
 )
-from typing import List, Optional
+from transformers.trainer_utils import PREFIX_CHECKPOINT_DIR
+from typing import List, Optional, Tuple, Union
 
 
 def maybe_zero_3(param, ignore_status=False, name=None):
@@ -96,6 +99,28 @@ def get_length_grouped_indices(lengths, batch_size, world_size, generator=None, 
     return [i for megabatch in megabatches for batch in megabatch for i in batch]
 
 
+def _enable_all_lora_gradients(model):
+    """set_adapter 후 비활성 어댑터의 requires_grad도 True로 재설정.
+    PEFT의 set_adapter는 비활성 어댑터 파라미터의 requires_grad를 False로 설정하므로,
+    end-to-end 학습을 위해 모든 LoRA 파라미터의 gradient를 활성화한다."""
+    for name, param in model.named_parameters():
+        if "lora_" in name:
+            param.requires_grad = True
+
+
+def _get_unwrapped_model(model):
+    """DDP/DeepSpeed/PEFT 래퍼를 벗겨서 LlavaLlamaForCausalLM 반환."""
+    unwrapped = model.module if hasattr(model, 'module') else model
+    unwrapped = getattr(unwrapped, 'base_model', unwrapped)
+    unwrapped = getattr(unwrapped, 'model', unwrapped)
+    return unwrapped
+
+
+def _get_peft_model(model):
+    """DDP/DeepSpeed만 벗겨서 PeftModel 반환 (adapter 제어용)."""
+    return model.module if hasattr(model, 'module') else model
+
+
 class LengthGroupedSampler(Sampler):
     r"""
     Sampler that samples indices in a way that groups together features of the dataset of roughly the same length while
@@ -146,6 +171,155 @@ class LLaVATrainer(Trainer):
             )
         else:
             return super()._get_train_sampler()
+
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
+        """Two-stage forward로 dual LoRA end-to-end 학습.
+
+        Stage 1 (summary_utilizer LoRA):
+          [고정프롬프트] + [이미지토큰] + [대표토큰] → LLM → summary hidden states
+        Stage 2 (default LoRA):
+          [텍스트 프롬프트] + [summary hidden states] → LLM → loss
+
+        이미지가 없거나 dual LoRA가 비활성이면 기존 단일 forward 사용.
+        """
+        # --- dual LoRA two-stage 학습 조건 확인 ---
+        base_model = _get_unwrapped_model(model)
+        config = getattr(base_model, 'config', None)
+        use_dual_lora = getattr(config, 'use_dual_lora', False)
+        use_summary_tokens = getattr(config, 'use_summary_tokens', False)
+        images = inputs.get('images', None)
+
+        if not (use_dual_lora and use_summary_tokens and images is not None):
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+        # --- 입력 분리 ---
+        input_ids = inputs['input_ids']
+        labels = inputs['labels']
+        attention_mask = inputs.get('attention_mask', None)
+        image_sizes = inputs.get('image_sizes', None)
+
+        # --- adapter controller 확보 ---
+        peft_model = _get_peft_model(model)
+        adapter_controller = base_model._get_adapter_controller()
+        if adapter_controller is None:
+            adapter_controller = peft_model if hasattr(peft_model, 'set_adapter') else None
+
+        if adapter_controller is None:
+            warnings.warn(
+                "Dual LoRA 학습이 설정되었지만 adapter controller를 찾을 수 없습니다. "
+                "단일 forward로 fallback합니다."
+            )
+            return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
+
+        # --- tokenizer 설정 (prepare_inputs_for_summary_generation_batch에 필요) ---
+        if getattr(base_model, 'tokenizer', None) is None:
+            base_model.tokenizer = self.tokenizer
+
+        # ================================================================
+        # Stage 1: Summary Generation (summary_utilizer adapter)
+        # ================================================================
+        adapter_controller.set_adapter("summary_utilizer")
+        _enable_all_lora_gradients(model)
+
+        # gradient checkpointing 비활성화 (Stage 1)
+        # adapter 전환 시 recomputation이 잘못된 adapter를 사용하는 문제 방지
+        gc_enabled = getattr(model, 'gradient_checkpointing', False)
+        if not gc_enabled:
+            # DeepSpeed/PEFT 래핑 모델에서 gradient_checkpointing 상태 확인
+            gc_enabled = getattr(base_model, 'gradient_checkpointing', False)
+            if not gc_enabled:
+                inner_model = getattr(base_model, 'model', None)
+                gc_enabled = getattr(inner_model, 'gradient_checkpointing', False) if inner_model else False
+
+        if gc_enabled:
+            if hasattr(model, 'gradient_checkpointing_disable'):
+                model.gradient_checkpointing_disable()
+            elif hasattr(base_model, 'gradient_checkpointing_disable'):
+                base_model.gradient_checkpointing_disable()
+
+        # Stage 1 입력 준비: [고정프롬프트] + [이미지토큰] + [대표토큰]
+        result = base_model.prepare_inputs_for_summary_generation_batch(
+            images=images,
+            image_sizes=image_sizes,
+            return_attention_mask=True
+        )
+        inputs_embeds_s1, summary_positions, custom_attention_mask = result
+
+        # attention mask 처리
+        forward_kwargs_s1 = {
+            'inputs_embeds': inputs_embeds_s1,
+            'output_hidden_states': True,
+            'return_dict': True,
+        }
+
+        if custom_attention_mask is not None:
+            from llava.model.attention_utils import combine_masks, convert_mask_to_additive
+
+            batch_size_s1, seq_len_s1 = inputs_embeds_s1.shape[0], inputs_embeds_s1.shape[1]
+            padding_mask = torch.ones(
+                batch_size_s1, seq_len_s1,
+                dtype=torch.bool,
+                device=inputs_embeds_s1.device
+            )
+            combined_mask = combine_masks(custom_attention_mask, padding_mask)
+            additive_mask = convert_mask_to_additive(combined_mask, dtype=inputs_embeds_s1.dtype)
+            forward_kwargs_s1['attention_mask'] = additive_mask
+
+        # Stage 1 LLM forward (labels 없음 → loss 미계산, gradient는 흐름)
+        outputs_s1 = model(**forward_kwargs_s1)
+
+        # summary hidden states 추출
+        last_hidden_states = outputs_s1.hidden_states[-1]
+        summary_hidden_states = base_model.extract_summary_hidden_states(
+            last_hidden_states, summary_positions
+        )  # [batch_size, num_summary_tokens, hidden_size]
+
+        # ================================================================
+        # Stage 2: Main Forward with Loss (default adapter)
+        # ================================================================
+        adapter_controller.set_adapter("default")
+        _enable_all_lora_gradients(model)
+
+        # gradient checkpointing 재활성화
+        if gc_enabled:
+            if hasattr(model, 'gradient_checkpointing_enable'):
+                model.gradient_checkpointing_enable()
+            elif hasattr(base_model, 'gradient_checkpointing_enable'):
+                base_model.gradient_checkpointing_enable()
+
+        # Stage 2 입력 준비: 이미지 토큰 위치에 summary hidden states 삽입
+        (
+            _,
+            position_ids_s2,
+            attention_mask_s2,
+            _,
+            inputs_embeds_s2,
+            labels_s2
+        ) = base_model.prepare_inputs_with_summary(
+            input_ids=input_ids,
+            position_ids=None,
+            attention_mask=attention_mask,
+            past_key_values=None,
+            labels=labels,
+            summary_hidden_states=summary_hidden_states,
+            image_sizes=image_sizes
+        )
+
+        # Stage 2 LLM forward (labels 포함 → loss 계산)
+        forward_kwargs_s2 = {
+            'inputs_embeds': inputs_embeds_s2,
+            'labels': labels_s2,
+            'return_dict': True,
+        }
+        if attention_mask_s2 is not None:
+            forward_kwargs_s2['attention_mask'] = attention_mask_s2
+        if position_ids_s2 is not None:
+            forward_kwargs_s2['position_ids'] = position_ids_s2
+
+        outputs_s2 = model(**forward_kwargs_s2)
+        loss = outputs_s2.loss
+
+        return (loss, outputs_s2) if return_outputs else loss
 
     def create_optimizer(self):
         """
