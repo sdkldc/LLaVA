@@ -7,6 +7,8 @@
 # Eager attention 사용으로 메모리 최적화 설정 적용
 # --include localhost:1 : GPU 1에서 실행
 # --include localhost:1,3 : GPU 1,3에서 실행
+# PYTHONNOUSERSITE=1 PYTHONPATH= bash ./scripts/compression/finetune_token_compress_check.sh
+
 
 deepspeed --include localhost:1,3 llava/train/train_mem.py \
     --deepspeed ./scripts/zero3.json \
@@ -23,15 +25,15 @@ deepspeed --include localhost:1,3 llava/train/train_mem.py \
     --image_aspect_ratio pad \
     --group_by_modality_length True \
     --bf16 True \
-    --output_dir ./checkpoints/llava-v1.5-7b-token32-batch256 \
+    --output_dir ./checkpoints/llava-v1.5-7b-check64 \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 64 \
-    --per_device_eval_batch_size 64 \
+    --per_device_train_batch_size 16 \
+    --per_device_eval_batch_size 16 \
     --gradient_accumulation_steps 2 \
     --max_steps 1000 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 10 \
+    --save_steps 1 \
     --save_total_limit 10 \
     --learning_rate 2e-4 \
     --weight_decay 0. \

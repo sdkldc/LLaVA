@@ -180,6 +180,13 @@ class LLaVATrainer(Trainer):
         Stage 2 (default LoRA):
           [텍스트 프롬프트] + [summary hidden states] → LLM → loss
 
+        Gradient checkpointing 호환:
+          - GC를 유지한 채 양 stage 모두 실행
+          - summary_hidden_states에 backward hook을 등록하여,
+            Stage 2 backward 완료 후 Stage 1 backward 시작 전에
+            adapter를 "summary_utilizer"로 자동 전환
+          - 이로써 GC recomputation 시 올바른 adapter 사용 보장
+
         이미지가 없거나 dual LoRA가 비활성이면 기존 단일 forward 사용.
         """
         # --- dual LoRA two-stage 학습 조건 확인 ---
@@ -200,9 +207,11 @@ class LLaVATrainer(Trainer):
 
         # --- adapter controller 확보 ---
         peft_model = _get_peft_model(model)
-        adapter_controller = base_model._get_adapter_controller()
-        if adapter_controller is None:
-            adapter_controller = peft_model if hasattr(peft_model, 'set_adapter') else None
+        adapter_controller = None
+        for candidate in [peft_model, getattr(peft_model, 'base_model', None)]:
+            if candidate is not None and hasattr(candidate, 'peft_config') and hasattr(candidate, 'set_adapter'):
+                adapter_controller = candidate
+                break
 
         if adapter_controller is None:
             warnings.warn(
@@ -211,31 +220,16 @@ class LLaVATrainer(Trainer):
             )
             return super().compute_loss(model, inputs, return_outputs=return_outputs, **kwargs)
 
-        # --- tokenizer 설정 (prepare_inputs_for_summary_generation_batch에 필요) ---
+        # --- tokenizer 설정 ---
         if getattr(base_model, 'tokenizer', None) is None:
             base_model.tokenizer = self.tokenizer
 
         # ================================================================
         # Stage 1: Summary Generation (summary_utilizer adapter)
+        # GC 유지 - backward hook으로 adapter 전환 보장
         # ================================================================
         adapter_controller.set_adapter("summary_utilizer")
         _enable_all_lora_gradients(model)
-
-        # gradient checkpointing 비활성화 (Stage 1)
-        # adapter 전환 시 recomputation이 잘못된 adapter를 사용하는 문제 방지
-        gc_enabled = getattr(model, 'gradient_checkpointing', False)
-        if not gc_enabled:
-            # DeepSpeed/PEFT 래핑 모델에서 gradient_checkpointing 상태 확인
-            gc_enabled = getattr(base_model, 'gradient_checkpointing', False)
-            if not gc_enabled:
-                inner_model = getattr(base_model, 'model', None)
-                gc_enabled = getattr(inner_model, 'gradient_checkpointing', False) if inner_model else False
-
-        if gc_enabled:
-            if hasattr(model, 'gradient_checkpointing_disable'):
-                model.gradient_checkpointing_disable()
-            elif hasattr(base_model, 'gradient_checkpointing_disable'):
-                base_model.gradient_checkpointing_disable()
 
         # Stage 1 입력 준비: [고정프롬프트] + [이미지토큰] + [대표토큰]
         result = base_model.prepare_inputs_for_summary_generation_batch(
@@ -275,17 +269,21 @@ class LLaVATrainer(Trainer):
         )  # [batch_size, num_summary_tokens, hidden_size]
 
         # ================================================================
+        # Backward hook: Stage 2 backward 완료 → adapter를 summary_utilizer로 전환
+        # Stage 1의 GC recomputation이 올바른 adapter를 사용하도록 보장
+        # ================================================================
+        def _switch_adapter_for_stage1_backward(grad):
+            adapter_controller.set_adapter("summary_utilizer")
+            _enable_all_lora_gradients(model)
+            return grad
+
+        summary_hidden_states.register_hook(_switch_adapter_for_stage1_backward)
+
+        # ================================================================
         # Stage 2: Main Forward with Loss (default adapter)
         # ================================================================
         adapter_controller.set_adapter("default")
         _enable_all_lora_gradients(model)
-
-        # gradient checkpointing 재활성화
-        if gc_enabled:
-            if hasattr(model, 'gradient_checkpointing_enable'):
-                model.gradient_checkpointing_enable()
-            elif hasattr(base_model, 'gradient_checkpointing_enable'):
-                base_model.gradient_checkpointing_enable()
 
         # Stage 2 입력 준비: 이미지 토큰 위치에 summary hidden states 삽입
         (
