@@ -210,11 +210,12 @@ class LLaVATrainer(Trainer):
         # 기본 training step 실행
         loss = super().training_step(model, inputs)
         
-        # Dual LoRA 사용 시 매 스텝마다 메모리 정리
+        # Dual LoRA 사용 시: gradient accumulation cycle 완료 후에만 캐시 정리
+        # (중간에 정리하면 gradient 계산에 영향)
         use_dual_lora = getattr(getattr(model, 'config', None), 'use_dual_lora', False)
         if use_dual_lora and torch.cuda.is_available():
-            # gradient accumulation 마지막 스텝에서만 정리 (성능 최적화)
-            if (self.state.global_step + 1) % self.args.gradient_accumulation_steps == 0:
+            # Gradient accumulation의 마지막 스텝에서만 실행
+            if self.accelerator.sync_gradients:
                 torch.cuda.empty_cache()
         
         return loss
@@ -334,13 +335,20 @@ class LLaVATrainer(Trainer):
         # ================================================================
         # Backward hook: Stage 2 backward 완료 → adapter를 summary_utilizer로 전환
         # Stage 1의 GC recomputation이 올바른 adapter를 사용하도록 보장
+        # 
+        # 메모리 누수 방지: hook handle을 저장하여 backward 후 제거
         # ================================================================
+        hook_handle = None
+        
         def _switch_adapter_for_stage1_backward(grad):
             adapter_controller.set_adapter("summary_utilizer")
             _enable_all_lora_gradients(model)
+            # Hook 실행 후 자동 제거 (메모리 누수 방지)
+            if hook_handle is not None:
+                hook_handle.remove()
             return grad
 
-        summary_hidden_states.register_hook(_switch_adapter_for_stage1_backward)
+        hook_handle = summary_hidden_states.register_hook(_switch_adapter_for_stage1_backward)
 
         # ================================================================
         # Stage 2: Main Forward with Loss (default adapter)
@@ -365,6 +373,11 @@ class LLaVATrainer(Trainer):
             summary_hidden_states=summary_hidden_states,
             image_sizes=image_sizes
         )
+        
+        # summary_hidden_states는 embeds에 복사되었으므로 이제 필요 없음
+        # 단, backward hook이 실행될 때까지 computational graph에는 남아있음
+        # Python reference만 해제 (메모리 누수 방지)
+        del summary_hidden_states
 
         # Stage 2 LLM forward (labels 포함 → loss 계산)
         forward_kwargs_s2 = {
