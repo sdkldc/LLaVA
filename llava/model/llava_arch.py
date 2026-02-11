@@ -271,13 +271,15 @@ class LlavaMetaForCausalLM(ABC):
                 if kmeans_apply_point == 'before_projector':
                     # 기본 방식: Vision Encoder → K-means → Centroid/Nearest → Projector
                     # Vision encoder 출력 가져오기 (프로젝터 통과 전)
+                    # image_features는 이미 프로젝터를 통과했으므로 다시 계산 필요
                     if hasattr(vision_tower, 'forward'):
                         vision_features_raw = vision_tower(images)
                         if isinstance(vision_features_raw, (list, tuple)):
                             vision_features_raw = vision_features_raw[0]
                     else:
-                        # 이미 인코딩된 경우 재사용 (비효율 방지)
-                        vision_features_raw = image_features
+                        # vision_tower를 직접 호출할 수 없으면 fallback
+                        # (비효율적이지만 안전성 보장)
+                        raise ValueError("Vision tower forward not available for kmeans_apply_point='before_projector'")
                     
                     # mm_projector의 dtype으로 변환
                     projector_dtype = next(mm_projector.parameters()).dtype
@@ -592,40 +594,52 @@ class LlavaMetaForCausalLM(ABC):
             new_input_embeds = [x[:tokenizer_model_max_length] for x in new_input_embeds]
             new_labels = [x[:tokenizer_model_max_length] for x in new_labels]
         
-        # Padding
+        # Padding (메모리 최적화: zero 텐서 재사용)
         max_len = max(x.shape[0] for x in new_input_embeds)
         batch_size = len(new_input_embeds)
         
+        # 첫 번째 샘플의 hidden_size 가져오기
+        hidden_size = new_input_embeds[0].shape[1]
+        dtype = new_input_embeds[0].dtype
+        device = new_input_embeds[0].device
+        
         new_input_embeds_padded = []
         new_labels_padded = torch.full((batch_size, max_len), IGNORE_INDEX, 
-                                       dtype=new_labels[0].dtype, device=new_labels[0].device)
+                                       dtype=new_labels[0].dtype, device=device)
         attention_mask = torch.zeros((batch_size, max_len), 
-                                     dtype=attention_mask.dtype, device=attention_mask.device)
+                                     dtype=attention_mask.dtype, device=device)
         position_ids = torch.zeros((batch_size, max_len), 
-                                   dtype=position_ids.dtype, device=position_ids.device)
+                                   dtype=position_ids.dtype, device=device)
+        
+        # padding side 확인
+        pad_left = getattr(self.config, 'tokenizer_padding_side', 'right') == "left"
         
         for i, (cur_new_embed, cur_new_labels) in enumerate(zip(new_input_embeds, new_labels)):
             cur_len = cur_new_embed.shape[0]
-            if getattr(self.config, 'tokenizer_padding_side', 'right') == "left":
-                new_input_embeds_padded.append(torch.cat((
-                    torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), 
-                                dtype=cur_new_embed.dtype, device=cur_new_embed.device),
-                    cur_new_embed
-                ), dim=0))
-                if cur_len > 0:
-                    new_labels_padded[i, -cur_len:] = cur_new_labels
-                    attention_mask[i, -cur_len:] = True
-                    position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
+            pad_len = max_len - cur_len
+            
+            if pad_len > 0:
+                # zero padding 생성 (한 번만)
+                padding = torch.zeros((pad_len, hidden_size), dtype=dtype, device=device)
+                
+                if pad_left:
+                    new_input_embeds_padded.append(torch.cat((padding, cur_new_embed), dim=0))
+                    if cur_len > 0:
+                        new_labels_padded[i, -cur_len:] = cur_new_labels
+                        attention_mask[i, -cur_len:] = True
+                        position_ids[i, -cur_len:] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=device)
+                else:
+                    new_input_embeds_padded.append(torch.cat((cur_new_embed, padding), dim=0))
+                    if cur_len > 0:
+                        new_labels_padded[i, :cur_len] = cur_new_labels
+                        attention_mask[i, :cur_len] = True
+                        position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=device)
             else:
-                new_input_embeds_padded.append(torch.cat((
-                    cur_new_embed,
-                    torch.zeros((max_len - cur_len, cur_new_embed.shape[1]), 
-                                dtype=cur_new_embed.dtype, device=cur_new_embed.device)
-                ), dim=0))
-                if cur_len > 0:
-                    new_labels_padded[i, :cur_len] = cur_new_labels
-                    attention_mask[i, :cur_len] = True
-                    position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=position_ids.device)
+                # padding 불필요
+                new_input_embeds_padded.append(cur_new_embed)
+                new_labels_padded[i, :cur_len] = cur_new_labels
+                attention_mask[i, :cur_len] = True
+                position_ids[i, :cur_len] = torch.arange(0, cur_len, dtype=position_ids.dtype, device=device)
         
         new_input_embeds = torch.stack(new_input_embeds_padded, dim=0)
         

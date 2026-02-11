@@ -13,7 +13,11 @@
 if [[ "${PYTORCH_CUDA_ALLOC_CONF:-}" == *"expandable_segments"* ]]; then
     unset PYTORCH_CUDA_ALLOC_CONF
 fi
-export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128,garbage_collection_threshold:0.8}"
+# 메모리 관리 최적화 (공격적):
+# - max_split_size_mb: 64MB로 감소 (더 작은 블록 사용, fragmentation 감소)
+# - garbage_collection_threshold: 0.9로 증가 (더 자주 GC 수행)
+# - roundup_power2_divisions: 더 세밀한 메모리 할당
+export PYTORCH_CUDA_ALLOC_CONF="max_split_size_mb:64,garbage_collection_threshold:0.9,roundup_power2_divisions:8"
 
 deepspeed --include localhost:1,3 llava/train/train_mem.py \
     --deepspeed ./scripts/zero3.json \
@@ -34,12 +38,12 @@ deepspeed --include localhost:1,3 llava/train/train_mem.py \
     --num_train_epochs 1 \
     --per_device_train_batch_size 16 \
     --per_device_eval_batch_size 16 \
-    --gradient_accumulation_steps 2 \
+    --gradient_accumulation_steps 4 \
     --max_steps 1000 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
-    --save_steps 1 \
-    --save_total_limit 10 \
+    --save_steps 10 \
+    --save_total_limit 5 \
     --learning_rate 2e-4 \
     --weight_decay 0. \
     --warmup_ratio 0.03 \

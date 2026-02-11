@@ -203,6 +203,22 @@ class LLaVATrainer(Trainer):
         else:
             return super()._get_train_sampler()
 
+    def training_step(self, model, inputs):
+        """
+        Training step with aggressive memory management for Dual LoRA.
+        """
+        # 기본 training step 실행
+        loss = super().training_step(model, inputs)
+        
+        # Dual LoRA 사용 시 매 스텝마다 메모리 정리
+        use_dual_lora = getattr(getattr(model, 'config', None), 'use_dual_lora', False)
+        if use_dual_lora and torch.cuda.is_available():
+            # gradient accumulation 마지막 스텝에서만 정리 (성능 최적화)
+            if (self.state.global_step + 1) % self.args.gradient_accumulation_steps == 0:
+                torch.cuda.empty_cache()
+        
+        return loss
+
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Two-stage forward로 dual LoRA end-to-end 학습.
 
@@ -277,16 +293,10 @@ class LLaVATrainer(Trainer):
         }
 
         if custom_attention_mask is not None:
-            from llava.model.attention_utils import combine_masks, convert_mask_to_additive
+            from llava.model.attention_utils import convert_mask_to_additive
 
-            batch_size_s1, seq_len_s1 = inputs_embeds_s1.shape[0], inputs_embeds_s1.shape[1]
-            padding_mask = torch.ones(
-                batch_size_s1, seq_len_s1,
-                dtype=torch.bool,
-                device=inputs_embeds_s1.device
-            )
-            combined_mask = combine_masks(custom_attention_mask, padding_mask)
-            additive_mask = convert_mask_to_additive(combined_mask, dtype=inputs_embeds_s1.dtype)
+            # padding_mask 불필요 (모든 토큰이 유효하므로 custom_mask만 사용)
+            additive_mask = convert_mask_to_additive(custom_attention_mask, dtype=inputs_embeds_s1.dtype)
             forward_kwargs_s1['attention_mask'] = additive_mask
 
         # Stage 1 LLM forward (labels/logits 계산 없이 backbone hidden state만 추출)
@@ -309,8 +319,17 @@ class LLaVATrainer(Trainer):
         summary_hidden_states = base_model.extract_summary_hidden_states(
             last_hidden_states, summary_positions
         ).contiguous()  # [batch_size, num_summary_tokens, hidden_size]
+        
+        # Stage 1 중간 텐서 명시적 해제 (메모리 압박 완화)
         del outputs_s1
         del last_hidden_states
+        del inputs_embeds_s1
+        if custom_attention_mask is not None:
+            del custom_attention_mask
+        
+        # Dual LoRA에서 Stage 1 후 메모리 정리 (메모리 압박 시 필수)
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
         # ================================================================
         # Backward hook: Stage 2 backward 완료 → adapter를 summary_utilizer로 전환
@@ -362,6 +381,22 @@ class LLaVATrainer(Trainer):
         outputs_s2 = model(**forward_kwargs_s2)
         loss = outputs_s2.loss
 
+        # Stage 2 중간 텐서 정리 (return_outputs=False 시)
+        if not return_outputs:
+            # outputs_s2의 logits 등 불필요한 텐서 해제
+            del outputs_s2
+            # Stage 2 inputs도 명시적 해제
+            del inputs_embeds_s2
+            del labels_s2
+            if attention_mask_s2 is not None:
+                del attention_mask_s2
+            if position_ids_s2 is not None:
+                del position_ids_s2
+            
+            # summary_hidden_states도 backward 후 필요 없으므로 해제
+            # (backward hook이 실행된 후에는 더 이상 필요 없음)
+            # 단, backward 전이므로 computational graph에는 여전히 연결됨
+        
         return (loss, outputs_s2) if return_outputs else loss
 
     def create_optimizer(self):
@@ -462,12 +497,36 @@ class LLaVATrainer(Trainer):
             if self.args.local_rank == 0 or self.args.local_rank == -1:
                 self.model.config.save_pretrained(output_dir)
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
+            
+            # weight_to_save 즉시 해제
+            del weight_to_save
         else:
+            # DeepSpeed ZeRO-3 checkpoint 저장 전 메모리 확보
+            if self.is_deepspeed_enabled and torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
 
-        # ZeRO-3 checkpoint 저장 직후 allocator fragmentation 완화
+        # ZeRO-3 checkpoint 저장 직후 적극적인 메모리 정리
         if torch.cuda.is_available():
+            # GPU 동기화 후 캐시 정리
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            
+            # DeepSpeed가 활성화된 경우 추가 메모리 정리
+            if self.is_deepspeed_enabled:
+                # 모든 GPU 동기화
+                import torch.distributed as dist
+                if dist.is_initialized():
+                    dist.barrier()
+                
+                # 추가 캐시 정리
+                torch.cuda.empty_cache()
+                
+                # allocator 통계 리셋으로 fragmentation 완화
+                if hasattr(torch.cuda, 'reset_peak_memory_stats'):
+                    torch.cuda.reset_peak_memory_stats()
+
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

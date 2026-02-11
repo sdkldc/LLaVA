@@ -75,7 +75,7 @@ def create_summary_token_attention_mask_optimized(
     dtype: torch.dtype = torch.float32
 ):
     """
-    최적화된 버전: 벡터화 연산으로 성능 향상
+    최적화된 버전: 벡터화 연산으로 성능 향상 + 메모리 효율 개선
     
     Args:
         batch_size (int): 배치 크기
@@ -87,7 +87,7 @@ def create_summary_token_attention_mask_optimized(
     Returns:
         torch.Tensor: Attention mask [batch_size, 1, seq_length, seq_length]
     """
-    # 요약 토큰 워치
+    # 요약 토큰 위치
     start_idx, end_idx = summary_token_positions
     num_summary_tokens = end_idx - start_idx
     
@@ -99,27 +99,16 @@ def create_summary_token_attention_mask_optimized(
         diagonal=1
     )
     
-    # 요약 토큰 행 영역만 추출하여 수정
-    # summary_region: [num_summary_tokens, seq_length]
-
-    summary_region = causal_mask[start_idx:end_idx, :]
-    
     # 요약 토큰끼리의 참조를 차단 (diagonal 제외)
-    # 요약 토큰 영역에 대해 off-diagonal 요소를 True로 설정
+    # in-place 연산으로 메모리 효율 향상
     summary_cross_mask = torch.ones(
         num_summary_tokens, num_summary_tokens, 
         dtype=torch.bool, device=device
     )
     summary_cross_mask.fill_diagonal_(False)  # 자기 자신은 참조 가능
     
-    # 요약 토큰 영역에 적용
-    summary_region[:, start_idx:end_idx] = torch.logical_or(
-        summary_region[:, start_idx:end_idx],
-        summary_cross_mask
-    )
-    
-    # 원본 mask에 반영
-    causal_mask[start_idx:end_idx, :] = summary_region
+    # 요약 토큰 영역에 직접 적용 (복사 없이 in-place)
+    causal_mask[start_idx:end_idx, start_idx:end_idx] |= summary_cross_mask
     
     # 배치 차원 추가
     attention_mask = causal_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)

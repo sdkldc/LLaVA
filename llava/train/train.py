@@ -210,6 +210,8 @@ def get_peft_state_for_adapter_maybe_zero_3(model, adapter_name, bias):
     """
     DeepSpeed ZeRO-3 환경에서 특정 adapter의 state_dict를 추출합니다.
     반환 키 형식은 PEFT save_pretrained가 기대하는 형식(어댑터 접미사 제거)입니다.
+    
+    메모리 최적화: GatheredParameters 사용 후 즉시 정리
     """
     original_adapter = _get_active_adapter_name(model)
     if hasattr(model, "set_adapter"):
@@ -253,7 +255,12 @@ def get_peft_state_for_adapter_maybe_zero_3(model, adapter_name, bias):
     else:
         raise NotImplementedError
 
+    # ZeRO-3 gather 후 CPU clone
     to_return = {k: maybe_zero_3(v, ignore_status=True) for k, v in to_return.items()}
+    
+    # 메모리 정리: adapter_params 즉시 해제
+    del adapter_params
+    
     return to_return
 
 
@@ -1255,6 +1262,8 @@ def train(attn_implementation=None):
                 rank0_print(f"  Loading 'default' adapter from {default_adapter_path}")
                 default_state_dict = safetensors.torch.load_file(default_adapter_path)
                 set_peft_model_state_dict(model, default_state_dict, adapter_name="default")
+                # state_dict 즉시 해제 (메모리 회수)
+                del default_state_dict
             else:
                 rank0_print(f"  Warning: missing default adapter file: {default_adapter_path}")
 
@@ -1264,10 +1273,16 @@ def train(attn_implementation=None):
                 rank0_print(f"  Loading 'summary_utilizer' adapter from {utilizer_adapter_path}")
                 utilizer_state_dict = safetensors.torch.load_file(utilizer_adapter_path)
                 set_peft_model_state_dict(model, utilizer_state_dict, adapter_name="summary_utilizer")
+                # state_dict 즉시 해제 (메모리 회수)
+                del utilizer_state_dict
             else:
                 rank0_print(f"  Warning: missing summary_utilizer adapter file: {utilizer_adapter_path}")
 
             rank0_print("✓ Dual LoRA adapter weights loaded successfully")
+            
+            # 메모리 정리
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             # 모든 ranks 동기화
             if dist.is_initialized():
@@ -1330,6 +1345,11 @@ def train(attn_implementation=None):
 
     if training_args.lora_enable:
         use_dual_lora = getattr(model.config, 'use_dual_lora', False)
+        
+        # ZeRO-3 환경에서 메모리 확보
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        
         # Save only LoRA adapter weights
         if use_dual_lora:
             # Root adapter_model.safetensors는 항상 'default' 어댑터를 저장.
@@ -1340,6 +1360,7 @@ def train(attn_implementation=None):
             state_dict = get_peft_state_maybe_zero_3(
                 model.named_parameters(), training_args.lora_bias
             )
+        
         # lora 외의 학습 가능한 파라미터들도 저장 (예: vision_tower)
         non_lora_state_dict = get_peft_state_non_lora_maybe_zero_3(
             model.named_parameters()
@@ -1377,7 +1398,18 @@ def train(attn_implementation=None):
                     json.dump(default_adapter_config, f, indent=2)
             else:
                 model.save_pretrained(training_args.output_dir, state_dict=state_dict)
+            
+            # state_dict 즉시 해제 (메모리 회수)
+            del state_dict
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
+            
+            # non_lora_state_dict 즉시 해제
+            del non_lora_state_dict
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
             
             # Dual LoRA: summary_utilizer 어댑터도 별도로 저장
             if use_dual_lora:
@@ -1407,6 +1439,19 @@ def train(attn_implementation=None):
                     rank0_print(f"✓ Saved summary_utilizer adapter to {summary_utilizer_dir} ({len(summary_utilizer_state_dict)} parameters)")
                 else:
                     rank0_print(f"⚠ Warning: summary_utilizer adapter state_dict is empty!")
+                
+                # summary_utilizer_state_dict 즉시 해제
+                del summary_utilizer_state_dict
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+        else:
+            # Non-rank0 processes도 state_dict 해제
+            del state_dict
+            del non_lora_state_dict
+            if use_dual_lora and summary_utilizer_state_dict is not None:
+                del summary_utilizer_state_dict
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
     else:
         safe_save_model_for_hf_trainer(trainer=trainer,
                                        output_dir=training_args.output_dir)
