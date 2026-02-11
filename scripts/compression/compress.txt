@@ -1,0 +1,7 @@
+
+컴포넌트	    1st Forward	2nd Forward	학습률	설명
+LLM (LoRA #1)	✅ 학습	  ❌ 고정	   2e-4	 이미지→요약 변환 학습
+LLM (LoRA #2)	❌ 고정	  ✅ 학습	   2e-4	 요약→답변 생성 학습
+Summary Tokens	✅ 학습	  ❌ 사용안함   2e-4	 8개 학습 가능한 토큰
+MM Projector	✅ 학습	  ❌ 사용안함   2e-5	 Vision→LLM 변환 (1st만)
+Vision Encoder	❌ 고정	  ❌ 사용안함	-	 CLIP 사전학습 가중치

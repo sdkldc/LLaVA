@@ -1,5 +1,6 @@
 #!/bin/bash
-
+# 1번째 사전학습을 수행.
+# Feature alignment를 위한 프로젝터를 학습.
 deepspeed llava/train/train_mem.py \
     --deepspeed ./scripts/zero2.json \
     --model_name_or_path lmsys/vicuna-13b-v1.5 \

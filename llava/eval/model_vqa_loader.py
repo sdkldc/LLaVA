@@ -81,7 +81,35 @@ def eval_model(args):
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+    
+    # Dual LoRA 지원을 위한 커스텀 로딩
+    # adapter_config.json이 있고 use_summary_tokens=True인 경우 Dual LoRA 로딩
+    use_dual_lora = (
+        os.path.exists(os.path.join(model_path, 'adapter_config.json')) and
+        os.path.exists(os.path.join(model_path, 'summary_utilizer')) and
+        getattr(args, 'use_summary_tokens', False) and
+        args.model_base is not None
+    )
+    
+    if use_dual_lora:
+        print("Loading model with Dual LoRA adapters (no merge)...")
+        from llava.model.builder import load_pretrained_model_dual_lora
+        tokenizer, model, image_processor, context_len = load_pretrained_model_dual_lora(
+            model_path, args.model_base, model_name
+        )
+    else:
+        tokenizer, model, image_processor, context_len = load_pretrained_model(
+            model_path, args.model_base, model_name
+        )
+    
+    # Set tokenizer to model for summary token generation
+    model.tokenizer = tokenizer
+    # PEFT 모델인 경우 base_model에도 설정
+    if hasattr(model, 'base_model'):
+        model.base_model.tokenizer = tokenizer
+        # base_model.model에도 설정 (LlavaLlamaForCausalLM)
+        if hasattr(model.base_model, 'model'):
+            model.base_model.model.tokenizer = tokenizer
 
     questions = [json.loads(q) for q in open(os.path.expanduser(args.question_file), "r")]
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
@@ -103,7 +131,7 @@ def eval_model(args):
 
         with torch.inference_mode():
             output_ids = model.generate(
-                input_ids,
+                input_ids=input_ids,
                 images=image_tensor.to(dtype=torch.float16, device='cuda', non_blocking=True),
                 image_sizes=image_sizes,
                 do_sample=True if args.temperature > 0 else False,
@@ -111,7 +139,8 @@ def eval_model(args):
                 top_p=args.top_p,
                 num_beams=args.num_beams,
                 max_new_tokens=args.max_new_tokens,
-                use_cache=True)
+                use_cache=True,
+                use_summary_tokens=getattr(args, 'use_summary_tokens', False))
 
         outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
 
@@ -139,6 +168,7 @@ if __name__ == "__main__":
     parser.add_argument("--top_p", type=float, default=None)
     parser.add_argument("--num_beams", type=int, default=1)
     parser.add_argument("--max_new_tokens", type=int, default=128)
+    parser.add_argument("--use-summary-tokens", action="store_true", help="Use two-stage inference with summary tokens")
     args = parser.parse_args()
 
     eval_model(args)

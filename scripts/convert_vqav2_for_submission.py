@@ -18,13 +18,29 @@ if __name__ == '__main__':
     args = parse_args()
 
     src = os.path.join(args.dir, 'answers', args.split, args.ckpt, 'merge.jsonl')
-    test_split = os.path.join(args.dir, 'llava_vqav2_mscoco_test2015.jsonl')
+    if not os.path.exists(src):
+        raise FileNotFoundError(
+            f"Missing merged answers: {src}\n"
+            f"Run inference first (e.g., scripts/v1_5/eval/vqav2.sh) to create merge.jsonl."
+        )
+    test_split = os.path.join(args.dir, f'{args.split}.jsonl')
+    if not os.path.exists(test_split):
+        legacy_test_split = os.path.join(args.dir, 'llava_vqav2_mscoco_test2015.jsonl')
+        if os.path.exists(legacy_test_split):
+            test_split = legacy_test_split
+        else:
+            raise FileNotFoundError(
+                f"Missing question file: {test_split}\n"
+                f"Expected under: {args.dir}\n"
+                f"If you only have VQA v2 test-dev, set --split llava_vqav2_mscoco_test-dev2015 "
+                f"and ensure {os.path.join(args.dir, 'llava_vqav2_mscoco_test-dev2015.jsonl')} exists."
+            )
     dst = os.path.join(args.dir, 'answers_upload', args.split, f'{args.ckpt}.json')
     os.makedirs(os.path.dirname(dst), exist_ok=True)
 
     results = []
     error_line = 0
-    for line_idx, line in enumerate(open(src)):
+    for _, line in enumerate(open(src)):
         try:
             results.append(json.loads(line))
         except:
@@ -32,7 +48,6 @@ if __name__ == '__main__':
 
     results = {x['question_id']: x['text'] for x in results}
     test_split = [json.loads(line) for line in open(test_split)]
-    split_ids = set([x['question_id'] for x in test_split])
 
     print(f'total results: {len(results)}, total split: {len(test_split)}, error_line: {error_line}')
 
@@ -53,4 +68,5 @@ if __name__ == '__main__':
             })
 
     with open(dst, 'w') as f:
-        json.dump(all_answers, open(dst, 'w'))
+        json.dump(all_answers, f)
+    print(f"wrote: {dst}")

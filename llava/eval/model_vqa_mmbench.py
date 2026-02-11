@@ -8,7 +8,7 @@ import shortuuid
 
 from llava.constants import IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.conversation import conv_templates, SeparatorStyle
-from llava.model.builder import load_pretrained_model
+from llava.model.builder import load_pretrained_model, load_pretrained_model_dual_lora
 from llava.utils import disable_torch_init
 from llava.mm_utils import tokenizer_image_token, process_images, load_image_from_base64, get_model_name_from_path
 
@@ -56,7 +56,28 @@ def eval_model(args):
     disable_torch_init()
     model_path = os.path.expanduser(args.model_path)
     model_name = get_model_name_from_path(model_path)
-    tokenizer, model, image_processor, context_len = load_pretrained_model(model_path, args.model_base, model_name)
+    use_dual_lora = (
+        os.path.exists(os.path.join(model_path, 'adapter_config.json'))
+        and os.path.exists(os.path.join(model_path, 'summary_utilizer'))
+        and getattr(args, 'use_summary_tokens', False)
+        and args.model_base is not None
+    )
+
+    if use_dual_lora:
+        print("Loading model with Dual LoRA adapters (no merge)...")
+        tokenizer, model, image_processor, context_len = load_pretrained_model_dual_lora(
+            model_path, args.model_base, model_name
+        )
+    else:
+        tokenizer, model, image_processor, context_len = load_pretrained_model(
+            model_path, args.model_base, model_name
+        )
+
+    model.tokenizer = tokenizer
+    if hasattr(model, 'base_model'):
+        model.base_model.tokenizer = tokenizer
+        if hasattr(model.base_model, 'model'):
+            model.base_model.model.tokenizer = tokenizer
 
     questions = pd.read_table(os.path.expanduser(args.question_file))
     questions = get_chunk(questions, args.num_chunks, args.chunk_idx)
@@ -118,7 +139,8 @@ def eval_model(args):
                     num_beams=args.num_beams,
                     # no_repeat_ngram_size=3,
                     max_new_tokens=1024,
-                    use_cache=True)
+                    use_cache=True,
+                    use_summary_tokens=getattr(args, 'use_summary_tokens', False))
 
             outputs = tokenizer.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
 
@@ -155,6 +177,7 @@ if __name__ == "__main__":
     parser.add_argument("--all-rounds", action="store_true")
     parser.add_argument("--single-pred-prompt", action="store_true")
     parser.add_argument("--lang", type=str, default="en")
+    parser.add_argument("--use-summary-tokens", action="store_true", help="Use two-stage inference with summary tokens")
     args = parser.parse_args()
 
     eval_model(args)
