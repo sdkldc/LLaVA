@@ -220,9 +220,31 @@ class LlavaMetaForCausalLM(ABC):
             images = images.unsqueeze(0)
         
         batch_size = images.shape[0]
-        
-        # 배치 이미지 인코딩: 비전 인코더 + 프로젝터
-        image_features = self.encode_images(images)  # [batch_size, num_image_tokens, hidden_size]
+
+        # K-means before_projector 모드: 비전 타워 1회 호출 후 raw features 재사용
+        # (기존: encode_images + vision_tower 이중 호출 → 수정: vision_tower 1회)
+        _kmeans_cfg = getattr(self.config, 'kmeans_init', False)
+        _kmeans_ap = getattr(self.config, 'kmeans_apply_point', 'before_projector')
+        _need_raw = _kmeans_cfg and _kmeans_ap == 'before_projector'
+        _vision_raw_for_kmeans = None
+
+        if _need_raw:
+            # 비전 타워 1회 호출 → raw features → projector 분리 실행
+            _vt = self.get_model().get_vision_tower()
+            _proj = self.get_model().mm_projector
+            _vt_dtype = next(_vt.parameters()).dtype
+            _proj_dtype = next(_proj.parameters()).dtype
+            _vision_raw = _vt(images.to(dtype=_vt_dtype))
+            if isinstance(_vision_raw, (list, tuple)):
+                _vision_raw = _vision_raw[0]
+            image_features = _proj(_vision_raw.to(dtype=_proj_dtype))
+            # kmeans용 raw features (detach로 gradient 분리)
+            _vision_raw_for_kmeans = _vision_raw.detach()
+            del _vision_raw
+        else:
+            # 표준 경로: encode_images (vision tower + projector)
+            image_features = self.encode_images(images)
+
         if isinstance(image_features, list):
             image_features = torch.stack(image_features, dim=0)
         if image_features.dim() == 2:
@@ -265,48 +287,31 @@ class LlavaMetaForCausalLM(ABC):
             num_summary_tokens = getattr(self.config, 'num_summary_tokens', 8)
             
             with torch.no_grad():
-                vision_tower = self.get_vision_tower()
                 mm_projector = self.get_model().mm_projector
-                
+
                 if kmeans_apply_point == 'before_projector':
                     # 기본 방식: Vision Encoder → K-means → Centroid/Nearest → Projector
-                    # Vision encoder 출력 가져오기 (프로젝터 통과 전)
-                    # image_features는 이미 프로젝터를 통과했으므로 다시 계산 필요
-                    if hasattr(vision_tower, 'forward'):
-                        vision_features_raw = vision_tower(images)
-                        if isinstance(vision_features_raw, (list, tuple)):
-                            vision_features_raw = vision_features_raw[0]
-                    else:
-                        # vision_tower를 직접 호출할 수 없으면 fallback
-                        # (비효율적이지만 안전성 보장)
-                        raise ValueError("Vision tower forward not available for kmeans_apply_point='before_projector'")
-                    
-                    # mm_projector의 dtype으로 변환
+                    # 위에서 비전 타워 1회 호출 시 저장된 raw features 재사용 (이중 호출 방지)
                     projector_dtype = next(mm_projector.parameters()).dtype
-                    vision_features_raw = vision_features_raw.to(dtype=projector_dtype)
-                    
-                    # 배치의 각 이미지에 대해 K-means 수행
+                    vision_features_raw = _vision_raw_for_kmeans.to(dtype=projector_dtype)
+
                     summary_embeds_list = []
-                    
+
                     for i in range(batch_size):
-                        # 단일 이미지의 vision features
-                        # [B, N, D] or [N, D] 처리:: N: 토큰 수, D: 특징 차원
-                        # 배치 사이즈 만큼 반복하여, 개별 대표 토큰 초기화 
                         single_vision_features = vision_features_raw[i] if vision_features_raw.dim() == 3 else vision_features_raw
-                        
-                        # K-means로 대표 토큰 추출 후 프로젝터 통과
-                        # gradient가 필요 없으므로 명시적으로 no_grad 적용하여 경고 방지
-                        with torch.no_grad():
-                            summary_tokens_for_image = initialize_summary_tokens_with_kmeans(
-                                vision_features=single_vision_features,
-                                mm_projector=mm_projector,
-                                num_summary_tokens=num_summary_tokens,
-                                metric=kmeans_metric,
-                                n_iter=kmeans_n_iter,
-                                random_state=42 + i,
-                                use_nearest=kmeans_use_nearest
-                            )  # [num_summary_tokens, hidden_size]
+
+                        summary_tokens_for_image = initialize_summary_tokens_with_kmeans(
+                            vision_features=single_vision_features,
+                            mm_projector=mm_projector,
+                            num_summary_tokens=num_summary_tokens,
+                            metric=kmeans_metric,
+                            n_iter=kmeans_n_iter,
+                            random_state=42 + i,
+                            use_nearest=kmeans_use_nearest
+                        )  # [num_summary_tokens, hidden_size]
                         summary_embeds_list.append(summary_tokens_for_image)
+
+                    del vision_features_raw  # kmeans 완료 후 해제
                 
                 elif kmeans_apply_point == 'after_projector':
                     # 대안 방식: Vision Encoder → Projector → K-means → Centroid/Nearest
