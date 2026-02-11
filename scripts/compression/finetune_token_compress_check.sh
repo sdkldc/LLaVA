@@ -9,6 +9,11 @@
 # --include localhost:1,3 : GPU 1,3에서 실행
 # PYTHONNOUSERSITE=1 PYTHONPATH= bash ./scripts/compression/finetune_token_compress_check.sh
 
+# torch 2.1.x 환경에서 expandable_segments는 allocator internal assert를 유발할 수 있음
+if [[ "${PYTORCH_CUDA_ALLOC_CONF:-}" == *"expandable_segments"* ]]; then
+    unset PYTORCH_CUDA_ALLOC_CONF
+fi
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-max_split_size_mb:128,garbage_collection_threshold:0.8}"
 
 deepspeed --include localhost:1,3 llava/train/train_mem.py \
     --deepspeed ./scripts/zero3.json \

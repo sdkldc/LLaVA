@@ -1,6 +1,7 @@
 import os
 import json
 import warnings
+import contextlib
 import torch
 import torch.nn as nn
 
@@ -156,6 +157,36 @@ class LengthGroupedSampler(Sampler):
 
 
 class LLaVATrainer(Trainer):
+    def create_accelerator_and_postprocess(self):
+        """
+        transformers==4.37 + accelerate==0.21 조합에서 DeepSpeed ZeRO-2/3 + grad accumulation 시
+        accelerate.accumulate()가 no_sync()를 호출하며 DeepSpeed assert가 발생한다.
+        DeepSpeed 엔진은 자체 accumulation을 처리하므로, 해당 경로에서는 no_sync를 no-op으로 바꾼다.
+        """
+        super().create_accelerator_and_postprocess()
+
+        if not getattr(self, "is_deepspeed_enabled", False):
+            return
+
+        accelerator = self.accelerator
+        if getattr(accelerator, "_llava_no_sync_patched_for_deepspeed", False):
+            return
+
+        original_no_sync = accelerator.no_sync
+
+        @contextlib.contextmanager
+        def _deepspeed_safe_no_sync(model):
+            # DeepSpeed ZeRO gradient partitioning(no_sync 비호환) 경로는 동기화를 유지.
+            if hasattr(model, "zero_optimization_partition_gradients"):
+                yield
+                return
+
+            with original_no_sync(model):
+                yield
+
+        accelerator.no_sync = _deepspeed_safe_no_sync
+        accelerator._llava_no_sync_patched_for_deepspeed = True
+
 
     def _get_train_sampler(self) -> Optional[torch.utils.data.Sampler]:
         if self.train_dataset is None or not has_length(self.train_dataset):
@@ -242,7 +273,6 @@ class LLaVATrainer(Trainer):
         # attention mask 처리
         forward_kwargs_s1 = {
             'inputs_embeds': inputs_embeds_s1,
-            'output_hidden_states': True,
             'return_dict': True,
         }
 
@@ -259,14 +289,28 @@ class LLaVATrainer(Trainer):
             additive_mask = convert_mask_to_additive(combined_mask, dtype=inputs_embeds_s1.dtype)
             forward_kwargs_s1['attention_mask'] = additive_mask
 
-        # Stage 1 LLM forward (labels 없음 → loss 미계산, gradient는 흐름)
-        outputs_s1 = model(**forward_kwargs_s1)
+        # Stage 1 LLM forward (labels/logits 계산 없이 backbone hidden state만 추출)
+        # 기존 model(...) 경로는 logits + (optionally) all hidden states를 생성해
+        # 메모리 피크를 키우므로, 동일한 마지막 hidden state만 사용하는 경로로 제한한다.
+        forward_kwargs_s1['use_cache'] = False
+        llm_backbone = base_model.get_model() if hasattr(base_model, "get_model") else None
+        if llm_backbone is None:
+            warnings.warn(
+                "Base model backbone을 찾을 수 없어 Stage 1에서 full model forward로 fallback합니다."
+            )
+            forward_kwargs_s1['output_hidden_states'] = True
+            outputs_s1 = model(**forward_kwargs_s1)
+            last_hidden_states = outputs_s1.hidden_states[-1]
+        else:
+            outputs_s1 = llm_backbone(**forward_kwargs_s1)
+            last_hidden_states = outputs_s1.last_hidden_state
 
-        # summary hidden states 추출
-        last_hidden_states = outputs_s1.hidden_states[-1]
+        # view가 원본 전체 hidden state storage를 잡고 있지 않도록 contiguous tensor로 분리
         summary_hidden_states = base_model.extract_summary_hidden_states(
             last_hidden_states, summary_positions
-        )  # [batch_size, num_summary_tokens, hidden_size]
+        ).contiguous()  # [batch_size, num_summary_tokens, hidden_size]
+        del outputs_s1
+        del last_hidden_states
 
         # ================================================================
         # Backward hook: Stage 2 backward 완료 → adapter를 summary_utilizer로 전환
@@ -308,6 +352,7 @@ class LLaVATrainer(Trainer):
             'inputs_embeds': inputs_embeds_s2,
             'labels': labels_s2,
             'return_dict': True,
+            'use_cache': False,
         }
         if attention_mask_s2 is not None:
             forward_kwargs_s2['attention_mask'] = attention_mask_s2
@@ -419,6 +464,10 @@ class LLaVATrainer(Trainer):
                 torch.save(weight_to_save, os.path.join(output_dir, f'mm_projector.bin'))
         else:
             super(LLaVATrainer, self)._save_checkpoint(model, trial, metrics)
+
+        # ZeRO-3 checkpoint 저장 직후 allocator fragmentation 완화
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
     def _save(self, output_dir: Optional[str] = None, state_dict=None):
         if getattr(self.args, 'tune_mm_mlp_adapter', False):

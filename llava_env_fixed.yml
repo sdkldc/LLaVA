@@ -149,7 +149,6 @@ dependencies:
       - jsonschema-specifications==2025.9.1
       - kiwisolver==1.4.9
       - latex2mathml==3.78.1
-      - llava==1.2.2.post1
       - lxml==4.9.4
       - markdown-it-py==4.0.0
       - markdown2==2.5.4
