@@ -103,10 +103,19 @@ def get_length_grouped_indices(lengths, batch_size, world_size, generator=None, 
 def _enable_all_lora_gradients(model):
     """set_adapter 후 비활성 어댑터의 requires_grad도 True로 재설정.
     PEFT의 set_adapter는 비활성 어댑터 파라미터의 requires_grad를 False로 설정하므로,
-    end-to-end 학습을 위해 모든 LoRA 파라미터의 gradient를 활성화한다."""
-    for name, param in model.named_parameters():
-        if "lora_" in name:
-            param.requires_grad = True
+    end-to-end 학습을 위해 모든 LoRA 파라미터의 gradient를 활성화한다.
+    
+    성능 최적화: LoRA 파라미터 목록을 캐싱하여 매 호출마다 전체 순회 방지.
+    """
+    # 모델에 캐시가 없으면 1회만 전체 순회하여 LoRA 파라미터 수집
+    cache = getattr(model, '_lora_params_cache', None)
+    if cache is None:
+        cache = [p for n, p in model.named_parameters() if "lora_" in n]
+        model._lora_params_cache = cache
+    
+    # 캐시된 파라미터만 순회 (O(n) → O(lora_params_count))
+    for param in cache:
+        param.requires_grad = True
 
 
 def _get_unwrapped_model(model):
@@ -328,89 +337,114 @@ class LLaVATrainer(Trainer):
         if custom_attention_mask is not None:
             del custom_attention_mask
         
-        # Dual LoRA에서 Stage 1 후 메모리 정리 (메모리 압박 시 필수)
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        # 성능 최적화: empty_cache() 호출 제거
+        # - 매 micro-step마다 호출하면 CUDA allocator 성능 크게 저하
+        # - Gradient accumulation 중간에 캐시를 비우면 다음 step에서 재할당 필요
+        # - training_step()의 sync_gradients 시점에서만 호출하는 것이 효율적
+        # 
+        # (극단적 메모리 부족 시에만 주석 해제)
+        # if torch.cuda.is_available():
+        #     torch.cuda.empty_cache()
 
         # ================================================================
         # Backward hook: Stage 2 backward 완료 → adapter를 summary_utilizer로 전환
         # Stage 1의 GC recomputation이 올바른 adapter를 사용하도록 보장
         # 
-        # 메모리 누수 방지: hook handle을 저장하여 backward 후 제거
+        # 메모리 누수 방지 + 예외 안전성:
+        # - try/finally로 예외 발생 시에도 hook 제거 보장
+        # - hook 내부에서도 제거하여 정상 경로에서 즉시 제거
+        # - nonlocal로 hook_handle 참조하여 closure에서 접근
         # ================================================================
         hook_handle = None
         
         def _switch_adapter_for_stage1_backward(grad):
-            adapter_controller.set_adapter("summary_utilizer")
-            _enable_all_lora_gradients(model)
-            # Hook 실행 후 자동 제거 (메모리 누수 방지)
-            if hook_handle is not None:
-                hook_handle.remove()
+            nonlocal hook_handle
+            try:
+                adapter_controller.set_adapter("summary_utilizer")
+                _enable_all_lora_gradients(model)
+            finally:
+                # Hook 실행 후 자동 제거 (메모리 누수 방지)
+                if hook_handle is not None:
+                    try:
+                        hook_handle.remove()
+                    except Exception:
+                        # Hook 제거 실패해도 계속 진행
+                        pass
+                    hook_handle = None
             return grad
 
         hook_handle = summary_hidden_states.register_hook(_switch_adapter_for_stage1_backward)
 
         # ================================================================
         # Stage 2: Main Forward with Loss (default adapter)
+        # try/finally로 예외 시에도 hook 제거 보장
         # ================================================================
-        adapter_controller.set_adapter("default")
-        _enable_all_lora_gradients(model)
+        try:
+            adapter_controller.set_adapter("default")
+            _enable_all_lora_gradients(model)
 
-        # Stage 2 입력 준비: 이미지 토큰 위치에 summary hidden states 삽입
-        (
-            _,
-            position_ids_s2,
-            attention_mask_s2,
-            _,
-            inputs_embeds_s2,
-            labels_s2
-        ) = base_model.prepare_inputs_with_summary(
-            input_ids=input_ids,
-            position_ids=None,
-            attention_mask=attention_mask,
-            past_key_values=None,
-            labels=labels,
-            summary_hidden_states=summary_hidden_states,
-            image_sizes=image_sizes
-        )
-        
-        # summary_hidden_states는 embeds에 복사되었으므로 이제 필요 없음
-        # 단, backward hook이 실행될 때까지 computational graph에는 남아있음
-        # Python reference만 해제 (메모리 누수 방지)
-        del summary_hidden_states
-
-        # Stage 2 LLM forward (labels 포함 → loss 계산)
-        forward_kwargs_s2 = {
-            'inputs_embeds': inputs_embeds_s2,
-            'labels': labels_s2,
-            'return_dict': True,
-            'use_cache': False,
-        }
-        if attention_mask_s2 is not None:
-            forward_kwargs_s2['attention_mask'] = attention_mask_s2
-        if position_ids_s2 is not None:
-            forward_kwargs_s2['position_ids'] = position_ids_s2
-
-        outputs_s2 = model(**forward_kwargs_s2)
-        loss = outputs_s2.loss
-
-        # Stage 2 중간 텐서 정리 (return_outputs=False 시)
-        if not return_outputs:
-            # outputs_s2의 logits 등 불필요한 텐서 해제
-            del outputs_s2
-            # Stage 2 inputs도 명시적 해제
-            del inputs_embeds_s2
-            del labels_s2
-            if attention_mask_s2 is not None:
-                del attention_mask_s2
-            if position_ids_s2 is not None:
-                del position_ids_s2
+            # Stage 2 입력 준비: 이미지 토큰 위치에 summary hidden states 삽입
+            (
+                _,
+                position_ids_s2,
+                attention_mask_s2,
+                _,
+                inputs_embeds_s2,
+                labels_s2
+            ) = base_model.prepare_inputs_with_summary(
+                input_ids=input_ids,
+                position_ids=None,
+                attention_mask=attention_mask,
+                past_key_values=None,
+                labels=labels,
+                summary_hidden_states=summary_hidden_states,
+                image_sizes=image_sizes
+            )
             
-            # summary_hidden_states도 backward 후 필요 없으므로 해제
-            # (backward hook이 실행된 후에는 더 이상 필요 없음)
-            # 단, backward 전이므로 computational graph에는 여전히 연결됨
-        
-        return (loss, outputs_s2) if return_outputs else loss
+            # summary_hidden_states는 embeds에 복사되었으므로 이제 필요 없음
+            # 단, backward hook이 실행될 때까지 computational graph에는 남아있음
+            # Python reference만 해제 (메모리 누수 방지)
+            del summary_hidden_states
+
+            # Stage 2 LLM forward (labels 포함 → loss 계산)
+            forward_kwargs_s2 = {
+                'inputs_embeds': inputs_embeds_s2,
+                'labels': labels_s2,
+                'return_dict': True,
+                'use_cache': False,
+            }
+            if attention_mask_s2 is not None:
+                forward_kwargs_s2['attention_mask'] = attention_mask_s2
+            if position_ids_s2 is not None:
+                forward_kwargs_s2['position_ids'] = position_ids_s2
+
+            outputs_s2 = model(**forward_kwargs_s2)
+            loss = outputs_s2.loss
+
+            # Stage 2 중간 텐서 정리 (return_outputs=False 시)
+            if not return_outputs:
+                # outputs_s2의 logits 등 불필요한 텐서 해제
+                del outputs_s2
+                # Stage 2 inputs도 명시적 해제
+                del inputs_embeds_s2
+                del labels_s2
+                if attention_mask_s2 is not None:
+                    del attention_mask_s2
+                if position_ids_s2 is not None:
+                    del position_ids_s2
+            
+            return (loss, outputs_s2) if return_outputs else loss
+            
+        finally:
+            # 예외 발생 시에도 hook 제거 보장 (이중 안전장치)
+            # 정상 경로에서는 _switch_adapter_for_stage1_backward에서 이미 제거됨
+            if hook_handle is not None:
+                try:
+                    hook_handle.remove()
+                except Exception:
+                    # Hook이 이미 제거되었거나 제거 실패 시 무시
+                    pass
+                hook_handle = None
 
     def create_optimizer(self):
         """
