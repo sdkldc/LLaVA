@@ -312,6 +312,7 @@ class LlavaMetaForCausalLM(ABC):
                         summary_embeds_list.append(summary_tokens_for_image)
 
                     del vision_features_raw  # kmeans 완료 후 해제
+                    del _vision_raw_for_kmeans  # 원본 raw features도 해제
                 
                 elif kmeans_apply_point == 'after_projector':
                     # 대안 방식: Vision Encoder → Projector → K-means → Centroid/Nearest

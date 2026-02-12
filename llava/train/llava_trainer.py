@@ -215,10 +215,20 @@ class LLaVATrainer(Trainer):
     def training_step(self, model, inputs):
         """
         Training step with aggressive memory management for Dual LoRA.
+        Hook 생명주기: compute_loss()에서 등록 → backward 완료 후 여기서 제거.
         """
-        # 기본 training step 실행
+        # 기본 training step 실행 (내부에서 compute_loss + backward 수행)
         loss = super().training_step(model, inputs)
-        
+
+        # backward 완료 후 Stage 1 backward hook 제거
+        hook_handle = getattr(self, '_s1_hook_handle', None)
+        if hook_handle is not None:
+            try:
+                hook_handle.remove()
+            except Exception:
+                pass
+            self._s1_hook_handle = None
+
         # Dual LoRA 사용 시: gradient accumulation cycle 완료 후에만 캐시 정리
         # (중간에 정리하면 gradient 계산에 영향)
         use_dual_lora = getattr(getattr(model, 'config', None), 'use_dual_lora', False)
@@ -226,7 +236,7 @@ class LLaVATrainer(Trainer):
             # Gradient accumulation의 마지막 스텝에서만 실행
             if self.accelerator.sync_gradients:
                 torch.cuda.empty_cache()
-        
+
         return loss
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
@@ -349,35 +359,30 @@ class LLaVATrainer(Trainer):
         # ================================================================
         # Backward hook: Stage 2 backward 완료 → adapter를 summary_utilizer로 전환
         # Stage 1의 GC recomputation이 올바른 adapter를 사용하도록 보장
-        # 
-        # 메모리 누수 방지 + 예외 안전성:
-        # - try/finally로 예외 발생 시에도 hook 제거 보장
-        # - hook 내부에서도 제거하여 정상 경로에서 즉시 제거
-        # - nonlocal로 hook_handle 참조하여 closure에서 접근
+        #
+        # Hook 생명주기:
+        #   compute_loss() → hook 등록 → return loss
+        #   training_step() → super().training_step() 내부에서 loss.backward()
+        #                   → backward 중 hook 실행 (adapter 전환)
+        #                   → backward 완료 후 training_step()에서 hook 제거
+        #
+        # 예외 안전성:
+        #   forward 중 예외 → try/finally에서 즉시 hook 제거
+        #   backward 중 예외 → training_step()의 hook 제거 로직에서 처리
         # ================================================================
-        hook_handle = None
-        
+
         def _switch_adapter_for_stage1_backward(grad):
-            nonlocal hook_handle
-            try:
-                adapter_controller.set_adapter("summary_utilizer")
-                _enable_all_lora_gradients(model)
-            finally:
-                # Hook 실행 후 자동 제거 (메모리 누수 방지)
-                if hook_handle is not None:
-                    try:
-                        hook_handle.remove()
-                    except Exception:
-                        # Hook 제거 실패해도 계속 진행
-                        pass
-                    hook_handle = None
+            adapter_controller.set_adapter("summary_utilizer")
+            _enable_all_lora_gradients(model)
             return grad
 
         hook_handle = summary_hidden_states.register_hook(_switch_adapter_for_stage1_backward)
+        # training_step()에서 backward 완료 후 제거할 수 있도록 self에 저장
+        self._s1_hook_handle = hook_handle
 
         # ================================================================
         # Stage 2: Main Forward with Loss (default adapter)
-        # try/finally로 예외 시에도 hook 제거 보장
+        # try/finally: forward 중 예외 시에만 hook 즉시 제거
         # ================================================================
         try:
             adapter_controller.set_adapter("default")
@@ -400,7 +405,7 @@ class LLaVATrainer(Trainer):
                 summary_hidden_states=summary_hidden_states,
                 image_sizes=image_sizes
             )
-            
+
             # summary_hidden_states는 embeds에 복사되었으므로 이제 필요 없음
             # 단, backward hook이 실행될 때까지 computational graph에는 남아있음
             # Python reference만 해제 (메모리 누수 방지)
@@ -423,28 +428,25 @@ class LLaVATrainer(Trainer):
 
             # Stage 2 중간 텐서 정리 (return_outputs=False 시)
             if not return_outputs:
-                # outputs_s2의 logits 등 불필요한 텐서 해제
                 del outputs_s2
-                # Stage 2 inputs도 명시적 해제
                 del inputs_embeds_s2
                 del labels_s2
                 if attention_mask_s2 is not None:
                     del attention_mask_s2
                 if position_ids_s2 is not None:
                     del position_ids_s2
-            
+
             return (loss, outputs_s2) if return_outputs else loss
-            
-        finally:
-            # 예외 발생 시에도 hook 제거 보장 (이중 안전장치)
-            # 정상 경로에서는 _switch_adapter_for_stage1_backward에서 이미 제거됨
-            if hook_handle is not None:
+
+        except Exception:
+            # forward 중 예외 발생 → backward 실행 안 되므로 hook 즉시 제거
+            if self._s1_hook_handle is not None:
                 try:
-                    hook_handle.remove()
+                    self._s1_hook_handle.remove()
                 except Exception:
-                    # Hook이 이미 제거되었거나 제거 실패 시 무시
                     pass
-                hook_handle = None
+                self._s1_hook_handle = None
+            raise
 
     def create_optimizer(self):
         """
