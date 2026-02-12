@@ -31,9 +31,9 @@ deepspeed --include localhost:1,3 llava/train/train_mem.py \
     --bf16 True \
     --output_dir ./checkpoints/llava-v1.5-7b-token32-batch128 \
     --num_train_epochs 1 \
-    --per_device_train_batch_size 16 \
-    --per_device_eval_batch_size 16 \
-    --gradient_accumulation_steps 4 \
+    --per_device_train_batch_size 8 \
+    --per_device_eval_batch_size 8 \
+    --gradient_accumulation_steps 8 \
     --max_steps 1000 \
     --evaluation_strategy "no" \
     --save_strategy "steps" \
