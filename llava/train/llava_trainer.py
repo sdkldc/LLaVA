@@ -131,6 +131,29 @@ def _get_peft_model(model):
     return model.module if hasattr(model, 'module') else model
 
 
+def _is_rank0():
+    """DDP/DeepSpeed 환경에서 rank 0인지 확인. 단일 GPU면 항상 True."""
+    import torch.distributed as dist
+    if dist.is_initialized():
+        return dist.get_rank() == 0
+    return True
+
+
+def _log_cuda_mem(tag: str):
+    """CUDA 메모리 통계를 MiB 단위로 로깅 (rank 0 전용)."""
+    if not (torch.cuda.is_available() and _is_rank0()):
+        return
+    alloc = torch.cuda.memory_allocated() / (1024 ** 2)
+    resv = torch.cuda.memory_reserved() / (1024 ** 2)
+    peak_alloc = torch.cuda.max_memory_allocated() / (1024 ** 2)
+    peak_resv = torch.cuda.max_memory_reserved() / (1024 ** 2)
+    logger.info(
+        f"[MemProbe][{tag}] "
+        f"alloc={alloc:.1f}MiB  resv={resv:.1f}MiB  "
+        f"peak_alloc={peak_alloc:.1f}MiB  peak_resv={peak_resv:.1f}MiB"
+    )
+
+
 class LengthGroupedSampler(Sampler):
     r"""
     Sampler that samples indices in a way that groups together features of the dataset of roughly the same length while
@@ -217,27 +240,40 @@ class LLaVATrainer(Trainer):
         Training step with aggressive memory management for Dual LoRA.
         Hook 생명주기: compute_loss()에서 등록 → backward 완료 후 여기서 제거.
         """
-        # 기본 training step 실행 (내부에서 compute_loss + backward 수행)
-        loss = super().training_step(model, inputs)
+        # --- MemProbe: step_begin ---
+        if torch.cuda.is_available() and _is_rank0():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+        _log_cuda_mem("step_begin")
 
-        # backward 완료 후 Stage 1 backward hook 제거
-        hook_handle = getattr(self, '_s1_hook_handle', None)
-        if hook_handle is not None:
-            try:
-                hook_handle.remove()
-            except Exception:
-                pass
-            self._s1_hook_handle = None
+        try:
+            # 기본 training step 실행 (내부에서 compute_loss + backward 수행)
+            loss = super().training_step(model, inputs)
 
-        # Dual LoRA 사용 시: gradient accumulation cycle 완료 후에만 캐시 정리
-        # (중간에 정리하면 gradient 계산에 영향)
-        use_dual_lora = getattr(getattr(model, 'config', None), 'use_dual_lora', False)
-        if use_dual_lora and torch.cuda.is_available():
-            # Gradient accumulation의 마지막 스텝에서만 실행
-            if self.accelerator.sync_gradients:
-                torch.cuda.empty_cache()
+            # backward 완료 후 Stage 1 backward hook 제거
+            hook_handle = getattr(self, '_s1_hook_handle', None)
+            if hook_handle is not None:
+                try:
+                    hook_handle.remove()
+                except Exception:
+                    pass
+                self._s1_hook_handle = None
 
-        return loss
+            # Dual LoRA 사용 시: gradient accumulation cycle 완료 후에만 캐시 정리
+            # (중간에 정리하면 gradient 계산에 영향)
+            use_dual_lora = getattr(getattr(model, 'config', None), 'use_dual_lora', False)
+            if use_dual_lora and torch.cuda.is_available():
+                # Gradient accumulation의 마지막 스텝에서만 실행
+                if self.accelerator.sync_gradients:
+                    torch.cuda.empty_cache()
+
+            return loss
+        finally:
+            # --- MemProbe: step_end + step_peak (예외 시에도 반드시 출력) ---
+            if torch.cuda.is_available() and _is_rank0():
+                torch.cuda.synchronize()
+            _log_cuda_mem("step_end")
+            _log_cuda_mem("step_peak")
 
     def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
         """Two-stage forward로 dual LoRA end-to-end 학습.
@@ -295,6 +331,11 @@ class LLaVATrainer(Trainer):
         # Stage 1: Summary Generation (summary_utilizer adapter)
         # GC 유지 - backward hook으로 adapter 전환 보장
         # ================================================================
+        _log_cuda_mem("S1_fwd_begin")
+        if torch.cuda.is_available() and _is_rank0():
+            torch.cuda.synchronize()
+            torch.cuda.reset_peak_memory_stats()
+
         adapter_controller.set_adapter("summary_utilizer")
         _enable_all_lora_gradients(model)
 
@@ -339,7 +380,13 @@ class LLaVATrainer(Trainer):
         summary_hidden_states = base_model.extract_summary_hidden_states(
             last_hidden_states, summary_positions
         ).contiguous()  # [batch_size, num_summary_tokens, hidden_size]
-        
+
+        # --- MemProbe: Stage 1 완료 ---
+        if torch.cuda.is_available() and _is_rank0():
+            torch.cuda.synchronize()
+        _log_cuda_mem("S1_fwd_end")
+        _log_cuda_mem("S1_fwd_peak")
+
         # Stage 1 중간 텐서 명시적 해제 (메모리 압박 완화)
         del outputs_s1
         del last_hidden_states
@@ -385,6 +432,12 @@ class LLaVATrainer(Trainer):
         # try/finally: forward 중 예외 시에만 hook 즉시 제거
         # ================================================================
         try:
+            # --- MemProbe: Stage 2 시작 ---
+            _log_cuda_mem("S2_fwd_begin")
+            if torch.cuda.is_available() and _is_rank0():
+                torch.cuda.synchronize()
+                torch.cuda.reset_peak_memory_stats()
+
             adapter_controller.set_adapter("default")
             _enable_all_lora_gradients(model)
 
@@ -435,6 +488,13 @@ class LLaVATrainer(Trainer):
                     del attention_mask_s2
                 if position_ids_s2 is not None:
                     del position_ids_s2
+
+            # --- MemProbe: Stage 2 완료 + compute_loss return 직전 ---
+            if torch.cuda.is_available() and _is_rank0():
+                torch.cuda.synchronize()
+            _log_cuda_mem("S2_fwd_end")
+            _log_cuda_mem("S2_fwd_peak")
+            _log_cuda_mem("compute_loss_return")
 
             return (loss, outputs_s2) if return_outputs else loss
 
